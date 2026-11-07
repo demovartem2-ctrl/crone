@@ -21,19 +21,18 @@ from aiohttp import web
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# --- ТВОИ НАСТРОЙКИ ---
+# --- НАСТРОЙКИ ---
 TOKEN = "1780247490:6n-hu-BofpQ8b7wBPbYCutwW9qluNWRwX4_"
 API_BASE = "https://31.76.29.36:8081"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 ADMIN_USERNAME = "sardelka"
-# ТЕПЕРЬ АДМИН ТОЛЬКО ТЫ
 DEFAULT_ADMINS = {1780243634}
 
 db_pool: asyncpg.Pool = None
 active_games = {}
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- ВЕБ-СЕРВЕР ---
 async def healthcheck(request): 
     return web.Response(text="OK")
 
@@ -59,7 +58,13 @@ async def init_db():
     async with db_pool.acquire() as c:
         await c.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY, username TEXT, balance BIGINT DEFAULT 0,
-            spent BIGINT DEFAULT 0, registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+            spent BIGINT DEFAULT 0, is_banned BOOLEAN DEFAULT FALSE, ban_until TIMESTAMP,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        
+        # Миграция под новые колонки бана
+        await c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE")
+        await c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMP")
+        
         await c.execute("""CREATE TABLE IF NOT EXISTS quest_proofs (
             id SERIAL PRIMARY KEY, user_id BIGINT, quest_id TEXT, quest_name TEXT,
             proof_text TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -86,7 +91,7 @@ async def wipe_database():
 
 async def get_user_info(uid: int):
     async with db_pool.acquire() as c:
-        return await c.fetchrow("SELECT username, balance, spent, registered_at FROM users WHERE user_id=$1", uid)
+        return await c.fetchrow("SELECT username, balance, spent, is_banned, ban_until, registered_at FROM users WHERE user_id=$1", uid)
 
 async def update_balance(uid: int, uname: Optional[str], amt: int, is_spending: bool = False) -> int:
     async with db_pool.acquire() as c:
@@ -111,6 +116,25 @@ async def admin_take_level(uid: int, amt: int) -> int:
         ns = max(0, row['spent'] - amt)
         await c.execute("UPDATE users SET spent=$1 WHERE user_id=$2", ns, uid)
         return ns
+
+async def set_ban_status(uid: int, status: bool, minutes: int = 0):
+    async with db_pool.acquire() as c:
+        if status:
+            until = datetime.now() + timedelta(minutes=minutes) if minutes > 0 else None
+            await c.execute("UPDATE users SET is_banned=TRUE, ban_until=$1 WHERE user_id=$2", until, uid)
+        else:
+            await c.execute("UPDATE users SET is_banned=FALSE, ban_until=NULL WHERE user_id=$1", uid)
+
+async def is_banned_db(uid: int) -> bool:
+    async with db_pool.acquire() as c:
+        row = await c.fetchrow("SELECT is_banned, ban_until FROM users WHERE user_id=$1", uid)
+        if not row or not row['is_banned']: return False
+        
+        if row['ban_until'] and datetime.now() > row['ban_until']:
+            await c.execute("UPDATE users SET is_banned=FALSE, ban_until=NULL WHERE user_id=$1", uid)
+            return False
+            
+        return True
 
 def get_level_info(spent: int) -> tuple[int, str]:
     spent = spent or 0
@@ -160,15 +184,14 @@ async def save_proof(uid: int, qid: str, qname: str):
     async with db_pool.acquire() as c:
         await c.execute("INSERT INTO quest_proofs (user_id,quest_id,quest_name) VALUES ($1,$2,$3)", uid, qid, qname)
 
-# --- КВЕСТЫ ---
 QUEST_POOL = {
     "q1": {"name": "Подписаться на @chickengun2", "reward": 2500, "desc": "Подпишись на канал @chickengun2 и нажми 'Я подписался'."},
 }
 
 async def check_and_rotate_quests():
-    # Оставили только один квест, поэтому ротация не нужна
     return list(QUEST_POOL.keys())
 
+# --- СТЕЙТЫ ---
 class AdminAmount(StatesGroup): target_id = State(); amount = State()
 class AdminTakeLevel(StatesGroup): target_id = State(); amount = State()
 class AdminTakeLevelAll(StatesGroup): amount = State()
@@ -187,6 +210,8 @@ class PromoEnter(StatesGroup): code = State()
 class Broadcast(StatesGroup): text = State(); confirm = State()
 class SportGame(StatesGroup): bet = State()
 class FishGame(StatesGroup): bet = State()
+class AdminBan(StatesGroup): target_id = State(); minutes = State()
+class AdminUnban(StatesGroup): target_id = State()
 
 async def safe_edit(msg: types.Message, text: str, kb=None, parse_mode="Markdown"):
     try:
@@ -206,7 +231,7 @@ def main_menu_kb(is_admin: bool) -> InlineKeyboardMarkup:
                  ("🎁 Бонус","daily_bonus"),("🆔 Мой ID","show_my_id"),
                  ("🆘 Поддержка","support_menu")]:
         b.button(text=t, callback_data=c)
-    if is_admin: b.button(text="💀 Панель мастера", callback_data="admin_panel")
+    if is_admin: b.button(text="💀 Админ панель", callback_data="admin_panel")
     b.adjust(2)
     return b.as_markup()
 
@@ -279,8 +304,8 @@ def support_kb() -> InlineKeyboardMarkup:
 
 def buy_stars_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for t, c in [("100 🪙 (1250 ⭐)","buy_stars_100"),("250 🪙 (3125 ⭐)","buy_stars_250"),
-                 ("500 🪙 (6250 ⭐)","buy_stars_500"),("✍️ Своя","buy_stars_custom"),
+    for t, c in [("100 🪙 (500000 ⭐)","buy_stars_100"),("250 🪙 (1250000 ⭐)","buy_stars_250"),
+                 ("500 🪙 (2500000 ⭐)","buy_stars_500"),("✍️ Своя","buy_stars_custom"),
                  ("🔙 Назад","balance_menu")]:
         b.button(text=t, callback_data=c)
     b.adjust(1)
@@ -309,6 +334,7 @@ def admin_kb() -> InlineKeyboardMarkup:
     for t, c in [("🪄 Выдать","admin_give"),("🪓 Отобрать","admin_take"),
                  ("🪓 Отобрать лвл","admin_take_level"),("🪓 Отобрать лвл у всех","admin_take_level_all"),
                  ("🪄 Начислить всем","admin_give_all"),("🪓 Отобрать у всех","admin_take_all"),
+                 ("🔨 Забанить","admin_ban"),("🕊️ Разбанить","admin_unban"),
                  ("✉️ Рассылка","admin_broadcast"),("🎟️ Создать промокод","admin_create_promo"), 
                  ("👥 Всего юзеров","admin_users_count"),
                  ("👤 Профиль","admin_check_profile"),("👁 Баланс","admin_check_bal"),
@@ -333,7 +359,36 @@ def cancel_kb(target: str = "admin_panel") -> InlineKeyboardMarkup:
 session = AiohttpSession(api=TelegramAPIServer.from_base(API_BASE))
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
-# ---------- СТАРТ / НАВИГАЦИЯ ----------
+
+# --- ПРОВЕРКА НА БАН (Middleware) ---
+@dp.message.middleware()
+@dp.callback_query.middleware()
+async def check_ban_middleware(handler, event, data):
+    uid = event.from_user.id
+    if await is_admin_db(uid):
+        return await handler(event, data)
+        
+    async with db_pool.acquire() as c:
+        row = await c.fetchrow("SELECT is_banned, ban_until FROM users WHERE user_id=$1", uid)
+        
+    if row and row['is_banned']:
+        if row['ban_until'] and datetime.now() > row['ban_until']:
+            await set_ban_status(uid, False)
+        else:
+            text = f"🚫 **Ты забанен!**\n"
+            if row['ban_until']:
+                rem = row['ban_until'] - datetime.now()
+                text += f"Осталось: **{rem.seconds // 60} мин.**\n"
+            text += f"Для разбана напиши: @{ADMIN_USERNAME}"
+            
+            if isinstance(event, types.CallbackQuery):
+                await event.answer("🚫 Ты забанен!", show_alert=True)
+            else:
+                await event.answer(text, parse_mode="Markdown")
+            return
+            
+    return await handler(event, data)
+    # ---------- СТАРТ / НАВИГАЦИЯ ----------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await update_balance(message.from_user.id,
@@ -495,7 +550,6 @@ async def _process_sport_bet(message: types.Message, state: FSMContext, sport_na
     await state.clear()
     await update_balance(message.from_user.id, None, -bet, is_spending=True)
     
-    # 65% шанс проиграть (35% выиграть)
     win = random.random() < 0.35
     
     if win:
@@ -556,7 +610,6 @@ async def fish_bet_input(message: types.Message, state: FSMContext):
     await state.clear()
     await update_balance(message.from_user.id, None, -bet, is_spending=True)
     
-    # Шансы: 30% мусор (0), 50% рыба (x1.7), 15% большая рыба (x2.5), 5% сундук (x5)
     rnd = random.random()
     if rnd < 0.30:
         prize = 0
@@ -894,7 +947,7 @@ async def upgr_fast(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "upgrade_slow")
 async def upgr_slow(cb: types.CallbackQuery, state: FSMContext):
     await _upgrader_finish(cb, state, 0.45, 1.8)
-  # ---------- ПЕРЕВОДЫ ----------
+    # ---------- ПЕРЕВОДЫ ----------
 @dp.callback_query(F.data == "transfer_start")
 async def transfer_start(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(TransferKrons.target)
@@ -940,13 +993,13 @@ async def transfer_amount(message: types.Message, state: FSMContext):
 # ---------- КУПИТЬ КРОНЫ (STARS) ----------
 @dp.callback_query(F.data == "buy_stars_menu")
 async def buy_stars_menu(cb: types.CallbackQuery):
-    await safe_edit(cb.message, "💎 **Покупка крон** (1🪙=12.5⭐)\nМин: 100🪙", buy_stars_kb())
+    await safe_edit(cb.message, "💎 **Покупка крон** (1🪙=5000⭐)\nМин: 1🪙", buy_stars_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "buy_stars_custom")
 async def buy_stars_custom(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(BuyStars.custom_amount)
-    await safe_edit(cb.message, "✍️ Введи кол-во крон (мин 100):", cancel_kb("balance_menu"))
+    await safe_edit(cb.message, "✍️ Введи кол-во крон (мин 1):", cancel_kb("balance_menu"))
     await cb.answer()
 
 @dp.message(BuyStars.custom_amount)
@@ -955,10 +1008,10 @@ async def buy_stars_amt(message: types.Message, state: FSMContext):
         p = int(message.text.strip())
     except: 
         return await message.answer("Число.")
-    if p < 100: 
-        return await message.answer("Мин 100.")
+    if p < 1: 
+        return await message.answer("Мин 1.")
     await state.clear()
-    stars_amount = int(p * 12.5)
+    stars_amount = p * 5000
     await message.answer_invoice(title="Кроны", description=f"{p} крон",
         prices=[LabeledPrice(label="XTR", amount=stars_amount)],
         provider_token="", currency="XTR", payload=f"stars_{p}")
@@ -971,7 +1024,7 @@ async def buy_stars_preset(cb: types.CallbackQuery):
         p = int(raw)
     except ValueError: 
         return await cb.answer("Ошибка.", show_alert=True)
-    stars_amount = int(p * 12.5)
+    stars_amount = p * 5000
     await cb.message.answer_invoice(title="Кроны", description=f"{p} крон",
         prices=[LabeledPrice(label="XTR", amount=stars_amount)],
         provider_token="", currency="XTR", payload=f"stars_{p}")
@@ -1037,7 +1090,7 @@ async def proof_sent(cb: types.CallbackQuery):
 async def admin_panel(cb: types.CallbackQuery):
     if not await is_admin_db(cb.from_user.id): 
         return await cb.answer("Нет.", show_alert=True)
-    await safe_edit(cb.message, "💀 **Панель Мастера**", admin_kb())
+    await safe_edit(cb.message, "💀 **Админ панель**", admin_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "admin_users_count")
@@ -1047,6 +1100,65 @@ async def admin_users_count(cb: types.CallbackQuery):
     count = await get_total_users_count()
     await safe_edit(cb.message, f"👥 **Статистика**\n\nВсего пользователей: **{count}**", admin_kb())
     await cb.answer()
+
+# ---------- БАН / РАЗБАН ----------
+@dp.callback_query(F.data == "admin_ban")
+async def admin_ban_start(cb: types.CallbackQuery, state: FSMContext):
+    if not await is_admin_db(cb.from_user.id): 
+        return await cb.answer("Нет.", show_alert=True)
+    await state.set_state(AdminBan.target_id)
+    await safe_edit(cb.message, "🔨 Кого забанить? (ID/username):", cancel_kb())
+    await cb.answer()
+
+@dp.message(AdminBan.target_id)
+async def admin_ban_target(message: types.Message, state: FSMContext):
+    t = await find_user_id(message.text)
+    if not t: 
+        return await message.answer("Не найден.")
+    if await is_admin_db(t):
+        return await message.answer("❌ Нельзя забанить админа!")
+    await state.update_data(target=t)
+    await state.set_state(AdminBan.minutes)
+    await message.answer("На сколько минут забанить? (Напиши `0` для вечного бана)", reply_markup=cancel_kb())
+
+@dp.message(AdminBan.minutes)
+async def admin_ban_minutes(message: types.Message, state: FSMContext):
+    try: 
+        mins = abs(int(message.text.strip()))
+    except: 
+        return await message.answer("❌ Введи число.")
+    
+    t = (await state.get_data()).get("target")
+    await state.clear()
+    await set_ban_status(t, True, mins)
+    
+    time_str = "навсегда" if mins == 0 else f"на {mins} мин."
+    await message.answer(f"✅ Пользователь `{t}` забанен {time_str}.", reply_markup=admin_kb(), parse_mode="Markdown")
+    try: 
+        await bot.send_message(t, f"🚫 Ты забанен {time_str}! Для разбана напиши @{ADMIN_USERNAME}")
+    except: 
+        pass
+
+@dp.callback_query(F.data == "admin_unban")
+async def admin_unban_start(cb: types.CallbackQuery, state: FSMContext):
+    if not await is_admin_db(cb.from_user.id): 
+        return await cb.answer("Нет.", show_alert=True)
+    await state.set_state(AdminUnban.target_id)
+    await safe_edit(cb.message, "🕊️ Кого разбанить? (ID/username):", cancel_kb())
+    await cb.answer()
+
+@dp.message(AdminUnban.target_id)
+async def admin_unban_input(message: types.Message, state: FSMContext):
+    t = await find_user_id(message.text)
+    if not t: 
+        return await message.answer("Не найден.")
+    await set_ban_status(t, False)
+    await state.clear()
+    await message.answer(f"✅ Пользователь `{t}` разбанен.", reply_markup=admin_kb(), parse_mode="Markdown")
+    try: 
+        await bot.send_message(t, f"🕊️ Ты разбанен! Добро пожаловать обратно.")
+    except: 
+        pass
 
 # ---------- РАССЫЛКА ----------
 @dp.callback_query(F.data == "admin_broadcast")
@@ -1059,7 +1171,6 @@ async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(Broadcast.text)
 async def admin_broadcast_text(message: types.Message, state: FSMContext):
-    # Сохраняем текст и тип разметки, если он был
     await state.update_data(bc_text=message.text, bc_pm=message.parse_mode)
     await state.set_state(Broadcast.confirm)
     await message.answer(f"📝 **Предпросмотр:**\n\n{message.text}\n\nОтправить всем?",
@@ -1069,15 +1180,12 @@ async def admin_broadcast_text(message: types.Message, state: FSMContext):
 async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
     if not await is_admin_db(cb.from_user.id): 
         return await cb.answer("Нет.", show_alert=True)
-    
     data = await state.get_data()
     text = data.get("bc_text")
-    pm = data.get("bc_pm") # Берем разметку, с которой админ отправил текст
+    pm = data.get("bc_pm")
     await state.clear()
-    
     if not text: 
         return await cb.answer("Текст потерян.", show_alert=True)
-        
     users = await get_all_users()
     await safe_edit(cb.message, f"🚀 Рассылка запущена на {len(users)} пользователей...\nПодожди немного.")
     await cb.answer()
@@ -1085,16 +1193,13 @@ async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
     ok = blocked = failed = 0
     for uid in users:
         try:
-            # Пытаемся отправить с той разметкой, которая была (или без неё)
             await bot.send_message(uid, text, parse_mode=pm)
             ok += 1
         except Exception as e:
             err = str(e).lower()
-            # Если бот заблокирован или юзер удален
             if any(x in err for x in ("blocked", "chat not found", "deactivated", "user is deactivated")):
                 blocked += 1
             else:
-                # Если упало из-за разметки — шлем без разметки
                 try:
                     await bot.send_message(uid, text)
                     ok += 1
@@ -1102,10 +1207,10 @@ async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
                     failed += 1
         await asyncio.sleep(0.05)
         
-    # Отчет админу
     await bot.send_message(cb.from_user.id,
         f"✅ **Рассылка завершена**\n\n📨 Доставлено: **{ok}**\n🚫 Заблокировали бота: **{blocked}**\n⚠️ Ошибок: **{failed}**",
         reply_markup=admin_kb(), parse_mode="Markdown")
+
 # ---------- СОЗДАНИЕ ПРОМО ----------
 @dp.callback_query(F.data == "admin_create_promo")
 async def admin_create_promo_start(cb: types.CallbackQuery, state: FSMContext):
@@ -1245,9 +1350,11 @@ async def admin_check_profile_input(message: types.Message, state: FSMContext):
     if not info: 
         return await message.answer("❌ Нет в базе.")
     level, title = get_level_info(info['spent'])
+    ban_status = "🚫 Забанен" if info['is_banned'] else "✅ Активен"
     await message.answer(
         f"📊 **Профиль игрока**\n\n👤 @{info['username'] or 'скрыт'}\n🆔 `{t}`\n\n"
-        f"🪙 Баланс: **{info['balance']}**\n💸 Потрачено: **{info['spent']}**\n📈 Уровень: **{level}** ({title})",
+        f"🪙 Баланс: **{info['balance']}**\n💸 Потрачено: **{info['spent']}**\n📈 Уровень: **{level}** ({title})\n"
+        f"🚦 Статус: {ban_status}",
         reply_markup=admin_kb(), parse_mode="Markdown")
 
 # ---------- АДМИН: ВЫДАТЬ АДМИНКУ ----------
@@ -1267,7 +1374,7 @@ async def admin_grant_input(message: types.Message, state: FSMContext):
     await state.clear()
     async with db_pool.acquire() as c:
         await c.execute("INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT DO NOTHING", t)
-    await message.answer(f"✅ `{t}` теперь Мастер!", reply_markup=admin_kb(), parse_mode="Markdown")
+    await message.answer(f"✅ `{t}` теперь Админ!", reply_markup=admin_kb(), parse_mode="Markdown")
 
 # ---------- АДМИН: ВЫДАТЬ / ОТОБРАТЬ ----------
 @dp.callback_query(F.data == "admin_give")
@@ -1467,7 +1574,7 @@ async def admin_wipe_db_confirm(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "admin_cancel")
 async def admin_cancel(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit(cb.message, "💀 Панель:", admin_kb())
+    await safe_edit(cb.message, "💀 Админ панель:", admin_kb())
     await cb.answer("Отменено")
 
 # ---------- СЕРВЕР / MAIN ----------
