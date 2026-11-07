@@ -1054,11 +1054,12 @@ async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
     if not await is_admin_db(cb.from_user.id): 
         return await cb.answer("Нет.", show_alert=True)
     await state.set_state(Broadcast.text)
-    await safe_edit(cb.message, "✉️ **Рассылка**\n\nОтправь текст сообщения:", cancel_kb())
+    await safe_edit(cb.message, "✉️ **Рассылка**\n\nОтправь текст сообщения (можно с эмодзи):", cancel_kb())
     await cb.answer()
 
 @dp.message(Broadcast.text)
 async def admin_broadcast_text(message: types.Message, state: FSMContext):
+    # Сохраняем текст и тип разметки, если он был
     await state.update_data(bc_text=message.text, bc_pm=message.parse_mode)
     await state.set_state(Broadcast.confirm)
     await message.answer(f"📝 **Предпросмотр:**\n\n{message.text}\n\nОтправить всем?",
@@ -1068,35 +1069,43 @@ async def admin_broadcast_text(message: types.Message, state: FSMContext):
 async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
     if not await is_admin_db(cb.from_user.id): 
         return await cb.answer("Нет.", show_alert=True)
-    text = (await state.get_data()).get("bc_text")
+    
+    data = await state.get_data()
+    text = data.get("bc_text")
+    pm = data.get("bc_pm") # Берем разметку, с которой админ отправил текст
     await state.clear()
+    
     if not text: 
         return await cb.answer("Текст потерян.", show_alert=True)
+        
     users = await get_all_users()
-    await safe_edit(cb.message, f"🚀 Рассылка на {len(users)} пользователей...")
+    await safe_edit(cb.message, f"🚀 Рассылка запущена на {len(users)} пользователей...\nПодожди немного.")
     await cb.answer()
     
     ok = blocked = failed = 0
     for uid in users:
         try:
-            await bot.send_message(uid, text, parse_mode="Markdown")
+            # Пытаемся отправить с той разметкой, которая была (или без неё)
+            await bot.send_message(uid, text, parse_mode=pm)
             ok += 1
         except Exception as e:
             err = str(e).lower()
-            if any(x in err for x in ("blocked","chat not found","deactivated")):
+            # Если бот заблокирован или юзер удален
+            if any(x in err for x in ("blocked", "chat not found", "deactivated", "user is deactivated")):
                 blocked += 1
             else:
+                # Если упало из-за разметки — шлем без разметки
                 try:
                     await bot.send_message(uid, text)
                     ok += 1
-                except: 
+                except:
                     failed += 1
         await asyncio.sleep(0.05)
         
+    # Отчет админу
     await bot.send_message(cb.from_user.id,
-        f"✅ **Рассылка завершена**\n\n📨 Доставлено: **{ok}**\n🚫 Заблокировали: **{blocked}**\n⚠️ Ошибок: **{failed}**",
+        f"✅ **Рассылка завершена**\n\n📨 Доставлено: **{ok}**\n🚫 Заблокировали бота: **{blocked}**\n⚠️ Ошибок: **{failed}**",
         reply_markup=admin_kb(), parse_mode="Markdown")
-
 # ---------- СОЗДАНИЕ ПРОМО ----------
 @dp.callback_query(F.data == "admin_create_promo")
 async def admin_create_promo_start(cb: types.CallbackQuery, state: FSMContext):
