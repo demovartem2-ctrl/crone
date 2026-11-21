@@ -60,11 +60,8 @@ async def init_db():
             user_id BIGINT PRIMARY KEY, username TEXT, balance BIGINT DEFAULT 0,
             spent BIGINT DEFAULT 0, is_banned BOOLEAN DEFAULT FALSE, ban_until TIMESTAMP,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        
-        # Миграция под новые колонки бана
         await c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE")
         await c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMP")
-        
         await c.execute("""CREATE TABLE IF NOT EXISTS quest_proofs (
             id SERIAL PRIMARY KEY, user_id BIGINT, quest_id TEXT, quest_name TEXT,
             proof_text TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -304,8 +301,8 @@ def support_kb() -> InlineKeyboardMarkup:
 
 def buy_stars_kb() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for t, c in [("100 🪙 (500000 ⭐)","buy_stars_100"),("250 🪙 (1250000 ⭐)","buy_stars_250"),
-                 ("500 🪙 (2500000 ⭐)","buy_stars_500"),("✍️ Своя","buy_stars_custom"),
+    for t, c in [("100 🪙 (100 ⭐)","buy_stars_100"),("250 🪙 (250 ⭐)","buy_stars_250"),
+                 ("500 🪙 (500 ⭐)","buy_stars_500"),("✍️ Своя","buy_stars_custom"),
                  ("🔙 Назад","balance_menu")]:
         b.button(text=t, callback_data=c)
     b.adjust(1)
@@ -536,7 +533,7 @@ async def show_games(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
 
 # ---------- СПОРТ: БАСКЕТБОЛ И ФУТБОЛ ----------
-async def _process_sport_bet(message: types.Message, state: FSMContext, sport_name: str, mult_win: float):
+async def _process_sport_bet(message: types.Message, state: FSMContext, sport_name: str, mult_win: float, sport_key: str):
     try:
         bet = int(message.text.strip())
         if bet <= 0: raise ValueError
@@ -561,7 +558,7 @@ async def _process_sport_bet(message: types.Message, state: FSMContext, sport_na
         text = f"💀 **Проигрыш в {sport_name}е.**\nСтавка сгорела: **-{bet}** 🪙\nБаланс: **{new_bal}**."
         
     b = InlineKeyboardBuilder()
-    b.button(text="🔄 Ещё", callback_data=f"game_{sport_name.lower()}")
+    b.button(text="🔄 Ещё", callback_data=f"game_{sport_key}")
     b.button(text="🔙 В игры", callback_data="games_menu")
     b.adjust(1)
     await message.answer(text, reply_markup=b.as_markup(), parse_mode="Markdown")
@@ -585,9 +582,9 @@ async def sport_bet_input(message: types.Message, state: FSMContext):
     data = await state.get_data()
     sport = data.get("sport")
     if sport == "basket":
-        await _process_sport_bet(message, state, "Баскетбол", 2.3)
+        await _process_sport_bet(message, state, "Баскетбол", 2.3, "basket")
     elif sport == "football":
-        await _process_sport_bet(message, state, "Футбол", 2.2)
+        await _process_sport_bet(message, state, "Футбол", 2.2, "football")
 
 # ---------- РЫБАЛКА ----------
 @dp.callback_query(F.data == "game_fish")
@@ -656,16 +653,16 @@ async def mines_difficulty(cb: types.CallbackQuery, state: FSMContext):
     diff = int(cb.data.replace("mines_diff_",""))
     await state.update_data(difficulty=diff)
     await state.set_state(MinesGame.bet)
-    await safe_edit(cb.message, f"💣 Режим: **{diff} мин**\n\nВведи ставку (10–5000):", cancel_kb("mines_menu"))
+    await safe_edit(cb.message, f"💣 Режим: **{diff} мин**\n\nВведи ставку:", cancel_kb("mines_menu"))
     await cb.answer()
 
 @dp.message(MinesGame.bet)
 async def mines_bet_input(message: types.Message, state: FSMContext):
     try:
         bet = int(message.text.strip())
-        if not (10 <= bet <= 5000): raise ValueError
+        if bet <= 0: raise ValueError
     except: 
-        return await message.answer("❌ Введи сумму от 10 до 5000.")
+        return await message.answer("❌ Введи сумму > 0.")
     uid = message.from_user.id
     if uid in active_games: 
         return await message.answer("❌ Сначала закончи текущую игру!")
@@ -990,10 +987,10 @@ async def transfer_amount(message: types.Message, state: FSMContext):
     except: 
         pass
 
-# ---------- КУПИТЬ КРОНЫ (STARS) ----------
+# ---------- КУПИТЬ КРОНЫ (STARS) — КУРС 1:1 ----------
 @dp.callback_query(F.data == "buy_stars_menu")
 async def buy_stars_menu(cb: types.CallbackQuery):
-    await safe_edit(cb.message, "💎 **Покупка крон** (1🪙=5000⭐)\nМин: 1🪙", buy_stars_kb())
+    await safe_edit(cb.message, "💎 **Покупка крон** (1 🪙 = 1 ⭐)\n\nВыбери пакет или введи своё количество:", buy_stars_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "buy_stars_custom")
@@ -1011,22 +1008,23 @@ async def buy_stars_amt(message: types.Message, state: FSMContext):
     if p < 1: 
         return await message.answer("Мин 1.")
     await state.clear()
-    stars_amount = p * 5000
+    # Курс 1 крона = 1 звезда
     await message.answer_invoice(title="Кроны", description=f"{p} крон",
-        prices=[LabeledPrice(label="XTR", amount=stars_amount)],
+        prices=[LabeledPrice(label="XTR", amount=p)],
         provider_token="", currency="XTR", payload=f"stars_{p}")
 
 @dp.callback_query(F.data.startswith("buy_stars_"))
 async def buy_stars_preset(cb: types.CallbackQuery):
     raw = cb.data.replace("buy_stars_","")
-    if raw in ("custom","menu"): return
+    if raw in ("custom","menu"): 
+        return  # обрабатывается отдельными хендлерами
     try: 
         p = int(raw)
     except ValueError: 
         return await cb.answer("Ошибка.", show_alert=True)
-    stars_amount = p * 5000
+    # Курс 1 крона = 1 звезда
     await cb.message.answer_invoice(title="Кроны", description=f"{p} крон",
-        prices=[LabeledPrice(label="XTR", amount=stars_amount)],
+        prices=[LabeledPrice(label="XTR", amount=p)],
         provider_token="", currency="XTR", payload=f"stars_{p}")
     await cb.answer()
 
@@ -1166,12 +1164,12 @@ async def admin_broadcast_start(cb: types.CallbackQuery, state: FSMContext):
     if not await is_admin_db(cb.from_user.id): 
         return await cb.answer("Нет.", show_alert=True)
     await state.set_state(Broadcast.text)
-    await safe_edit(cb.message, "✉️ **Рассылка**\n\nОтправь текст сообщения (можно с эмодзи):", cancel_kb())
+    await safe_edit(cb.message, "✉️ **Рассылка**\n\nОтправь текст сообщения:", cancel_kb())
     await cb.answer()
 
 @dp.message(Broadcast.text)
 async def admin_broadcast_text(message: types.Message, state: FSMContext):
-    await state.update_data(bc_text=message.text, bc_pm=message.parse_mode)
+    await state.update_data(bc_text=message.text)
     await state.set_state(Broadcast.confirm)
     await message.answer(f"📝 **Предпросмотр:**\n\n{message.text}\n\nОтправить всем?",
                          reply_markup=broadcast_confirm_kb(), parse_mode="Markdown")
@@ -1182,7 +1180,6 @@ async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
         return await cb.answer("Нет.", show_alert=True)
     data = await state.get_data()
     text = data.get("bc_text")
-    pm = data.get("bc_pm")
     await state.clear()
     if not text: 
         return await cb.answer("Текст потерян.", show_alert=True)
@@ -1193,18 +1190,14 @@ async def admin_broadcast_confirm(cb: types.CallbackQuery, state: FSMContext):
     ok = blocked = failed = 0
     for uid in users:
         try:
-            await bot.send_message(uid, text, parse_mode=pm)
+            await bot.send_message(uid, text)
             ok += 1
         except Exception as e:
             err = str(e).lower()
             if any(x in err for x in ("blocked", "chat not found", "deactivated", "user is deactivated")):
                 blocked += 1
             else:
-                try:
-                    await bot.send_message(uid, text)
-                    ok += 1
-                except:
-                    failed += 1
+                failed += 1
         await asyncio.sleep(0.05)
         
     await bot.send_message(cb.from_user.id,
@@ -1228,18 +1221,24 @@ async def promo_name(message: types.Message, state: FSMContext):
 
 @dp.message(PromoCreate.reward)
 async def promo_reward(message: types.Message, state: FSMContext):
-    try: r = int(message.text.strip())
-    except: return await message.answer("❌ Введи число.")
-    if r <= 0: return await message.answer("❌ Больше 0.")
+    try: 
+        r = int(message.text.strip())
+    except: 
+        return await message.answer("❌ Введи число.")
+    if r <= 0: 
+        return await message.answer("❌ Больше 0.")
     await state.update_data(promo_reward=r)
     await state.set_state(PromoCreate.limit)
     await message.answer("Сколько раз можно использовать?", reply_markup=cancel_kb())
 
 @dp.message(PromoCreate.limit)
 async def promo_limit(message: types.Message, state: FSMContext):
-    try: l = int(message.text.strip())
-    except: return await message.answer("❌ Введи число.")
-    if l <= 0: return await message.answer("❌ Больше 0.")
+    try: 
+        l = int(message.text.strip())
+    except: 
+        return await message.answer("❌ Введи число.")
+    if l <= 0: 
+        return await message.answer("❌ Больше 0.")
     data = await state.get_data()
     await state.clear()
     name, reward = data['promo_name'], data['promo_reward']
@@ -1582,7 +1581,6 @@ async def main():
     await start_web_server()
     log.info("Подключение к БД...")
     await init_db()
-    
     log.info("Бот запущен!")
     await dp.start_polling(bot)
 
