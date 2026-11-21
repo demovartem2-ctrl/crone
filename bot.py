@@ -22,7 +22,8 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 # --- НАСТРОЙКИ ---
-TOKEN = "1780247490:6n-hu-BofpQ8b7wBPbYCutwW9qluNWRwX4_"
+# Берем токен из переменных окружения, если нет - используем новый токен
+TOKEN = os.environ.get("TOKEN", "269:5Ms0gyoR1wqqRnoDGhTuCB5WxGV2SEfJtQ4")
 API_BASE = "https://31.76.29.36:8081"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
@@ -33,6 +34,7 @@ db_pool: asyncpg.Pool = None
 active_games = {}
 
 # --- ВЕБ-СЕРВЕР ---
+# ... дальше идет твой код healthcheck и т.д.
 async def healthcheck(request): 
     return web.Response(text="OK")
 
